@@ -62,8 +62,8 @@ iptables -t nat -A OUTPUT -p tcp --dport 80 -m owner ! --uid-owner 13 -j DNAT --
 
 For FORWARD trafik:
 ```
-iptables -t nat -I POSTROUTING -p tcp --dport 443 -j DNAT --to 127.0.0.1:3130
-iptables -t nat -I POSTROUTING -p tcp --dport 80 -j DNAT --to 127.0.0.1:3131
+iptables -t nat -I PREROUTING -p tcp --dport 443 -j DNAT --to 127.0.0.1:3130
+iptables -t nat -I PREROUTING -p tcp --dport 80 -j DNAT --to 127.0.0.1:3131
 ```
 
 Logs:
