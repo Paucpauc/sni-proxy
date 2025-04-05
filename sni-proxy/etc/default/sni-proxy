@@ -1,0 +1,9 @@
+LISTEN=127.0.0.1
+HTTPS_PORT=3130
+HTTP_PORT=3131
+
+HTTPS_PROXY=http://proxy.games.tools:3128
+
+NO_PROXY="localhost,.games.tools,.pvt,.local,.srv"
+
+PYTHONUNBUFFERED=yes

@@ -1,0 +1,4 @@
+#!/bin/sh
+systemctl stop sni-proxy
+systemctl disable sni-proxy
+systemctl daemon-reload

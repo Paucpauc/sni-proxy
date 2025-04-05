@@ -1,0 +1,8 @@
+Package: sni-proxy
+Version: %VERSION%
+Section: base
+Priority: optional
+Architecture: all
+Depends: curl
+Maintainer: Andrey Urbanovich <andrey.urbanovich@astrum.team>
+Description: SSL Transparent proxy forwarder

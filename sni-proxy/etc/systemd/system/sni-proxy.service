@@ -1,0 +1,13 @@
+[Unit]
+Description=SSL TProxy
+After=network.target
+
+[Service]
+ExecStart=/bin/sni-proxy
+EnvironmentFile=/etc/default/sni-proxy
+User=proxy
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
