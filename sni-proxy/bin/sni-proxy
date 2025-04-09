@@ -5,6 +5,7 @@ import argparse
 import os
 import re
 import struct
+import ssl
 from typing import Tuple, Optional, List, Dict
 
 # Constants
@@ -53,39 +54,30 @@ def get_proxy_only_list() -> List[str]:
     proxy_only = os.environ.get('PROXY_ONLY', os.environ.get('PROXY_ONLY', ''))
     return [domain.strip().lower() for domain in proxy_only.split(',') if domain.strip()]
 
-async def parse_sni(data: bytes) -> Optional[str]:
-    """Parse SNI from TLS ClientHello"""
+def parse_sni(data: bytes) -> Optional[str]:
+    """Extract SNI from TLS ClientHello using ssl library"""
+    sni = [None]
+
+    def sni_callback(sslobj, hostname, context):
+        sni[0] = hostname
+        return None
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.verify_mode = ssl.CERT_NONE
+    context.set_servername_callback(sni_callback)
+
+    bio_in = ssl.MemoryBIO()
+    bio_out = ssl.MemoryBIO()
+
+    bio_in.write(data)
+    sslobj = context.wrap_bio(bio_in, bio_out, server_side=True)
+
     try:
-        if data[0] == 0x16 and data[5] == 0x01:
-            offset = 5 + 38
-            session_id_length = data[offset]
-            offset += 1 + session_id_length
-            cipher_suites_length = int.from_bytes(data[offset:offset+2], 'big')
-            offset += 2 + cipher_suites_length
-            compression_methods_length = data[offset]
-            offset += 1 + compression_methods_length
-            extensions_length = int.from_bytes(data[offset:offset+2], 'big')
-            offset += 2
-            end_extensions = offset + extensions_length
-            while offset < end_extensions:
-                extension_type = int.from_bytes(data[offset:offset+2], 'big')
-                offset += 2
-                extension_length = int.from_bytes(data[offset:offset+2], 'big')
-                offset += 2
-                if extension_type == 0x00:
-                    sni_list_length = int.from_bytes(data[offset:offset+2], 'big')
-                    offset += 2
-                    if sni_list_length > 0:
-                        sni_type = data[offset]
-                        offset += 1
-                        sni_length = int.from_bytes(data[offset:offset+2], 'big')
-                        offset += 2
-                        return data[offset:offset+sni_length].decode('utf-8')
-                else:
-                    offset += extension_length
-    except (IndexError, ValueError):
+        sslobj.do_handshake()
+    except ssl.SSLError:
         pass
-    return None
+
+    return sni[0]
 
 async def parse_http_host(data: bytes) -> Optional[str]:
     """Parse Host header from HTTP request"""
@@ -146,7 +138,7 @@ async def handle_https_client(
             await writer.wait_closed()
             return
 
-        sni = await parse_sni(data)
+        sni = parse_sni(data)
         if not sni:
             print(f"SNI not found from {client_ip}")
             writer.close()
