@@ -23,13 +23,11 @@ SO_ORIGINAL_DST = 80  # Typically 80 on Linux systems
 def get_original_dst(sock: socket.socket) -> Optional[Tuple[str, int]]:
     """Get original destination using SO_ORIGINAL_DST (Linux only)"""
     try:
-        # For IPv4
         if sock.family == socket.AF_INET:
             dst = sock.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
             port, ip = struct.unpack("!2xH4s8x", dst)
             ip = socket.inet_ntoa(ip)
             return ip, port
-        # For IPv6 (not implemented)
     except (OSError, struct.error):
         pass
     return None
@@ -39,11 +37,7 @@ def get_proxy_from_env() -> Tuple[Optional[str], Optional[int]]:
     proxy_url = os.environ.get('https_proxy', os.environ.get('HTTPS_PROXY'))
     if not proxy_url:
         return None, None
-
-    # Remove protocol if present
     proxy_url = re.sub(r'^https?://', '', proxy_url)
-
-    # Parse host:port
     if ':' in proxy_url:
         host, port = proxy_url.split(':', 1)
         return host, int(port)
@@ -54,38 +48,41 @@ def get_no_proxy_list() -> List[str]:
     no_proxy = os.environ.get('no_proxy', os.environ.get('NO_PROXY', ''))
     return [domain.strip().lower() for domain in no_proxy.split(',') if domain.strip()]
 
+def get_proxy_only_list() -> List[str]:
+    """Get proxy-only list from environment variables"""
+    proxy_only = os.environ.get('PROXY_ONLY', os.environ.get('PROXY_ONLY', ''))
+    return [domain.strip().lower() for domain in proxy_only.split(',') if domain.strip()]
+
 async def parse_sni(data: bytes) -> Optional[str]:
     """Parse SNI from TLS ClientHello"""
     try:
-        if data[0] == 0x16:  # TLS Handshake
-            if data[5] == 0x01:  # Client Hello
-                offset = 5 + 38
-                session_id_length = data[offset]
-                offset += 1 + session_id_length
-                cipher_suites_length = int.from_bytes(data[offset:offset+2], 'big')
-                offset += 2 + cipher_suites_length
-                compression_methods_length = data[offset]
-                offset += 1 + compression_methods_length
-                if len(data) > offset + 2:
-                    extensions_length = int.from_bytes(data[offset:offset+2], 'big')
+        if data[0] == 0x16 and data[5] == 0x01:
+            offset = 5 + 38
+            session_id_length = data[offset]
+            offset += 1 + session_id_length
+            cipher_suites_length = int.from_bytes(data[offset:offset+2], 'big')
+            offset += 2 + cipher_suites_length
+            compression_methods_length = data[offset]
+            offset += 1 + compression_methods_length
+            extensions_length = int.from_bytes(data[offset:offset+2], 'big')
+            offset += 2
+            end_extensions = offset + extensions_length
+            while offset < end_extensions:
+                extension_type = int.from_bytes(data[offset:offset+2], 'big')
+                offset += 2
+                extension_length = int.from_bytes(data[offset:offset+2], 'big')
+                offset += 2
+                if extension_type == 0x00:
+                    sni_list_length = int.from_bytes(data[offset:offset+2], 'big')
                     offset += 2
-                    end_extensions = offset + extensions_length
-                    while offset < end_extensions:
-                        extension_type = int.from_bytes(data[offset:offset+2], 'big')
+                    if sni_list_length > 0:
+                        sni_type = data[offset]
+                        offset += 1
+                        sni_length = int.from_bytes(data[offset:offset+2], 'big')
                         offset += 2
-                        extension_length = int.from_bytes(data[offset:offset+2], 'big')
-                        offset += 2
-                        if extension_type == 0x00:  # SNI extension
-                            sni_list_length = int.from_bytes(data[offset:offset+2], 'big')
-                            offset += 2
-                            if sni_list_length > 0:
-                                sni_type = data[offset]
-                                offset += 1
-                                sni_length = int.from_bytes(data[offset:offset+2], 'big')
-                                offset += 2
-                                return data[offset:offset+sni_length].decode('utf-8')
-                        else:
-                            offset += extension_length
+                        return data[offset:offset+sni_length].decode('utf-8')
+                else:
+                    offset += extension_length
     except (IndexError, ValueError):
         pass
     return None
@@ -128,7 +125,8 @@ async def handle_https_client(
     writer: asyncio.StreamWriter,
     proxy_host: Optional[str],
     proxy_port: Optional[int],
-    no_proxy_list: List[str]
+    no_proxy_list: List[str],
+    proxy_only_list: List[str]
 ) -> None:
     """Handle HTTPS connection by parsing SNI"""
     client_ip, _ = writer.get_extra_info('peername')
@@ -161,6 +159,7 @@ async def handle_https_client(
             client_ip,
             proxy_host, proxy_port,
             no_proxy_list,
+            proxy_only_list,
             initial_data=data,
             is_https=True
         )
@@ -179,7 +178,8 @@ async def handle_http_client(
     writer: asyncio.StreamWriter,
     proxy_host: Optional[str],
     proxy_port: Optional[int],
-    no_proxy_list: List[str]
+    no_proxy_list: List[str],
+    proxy_only_list: List[str]
 ) -> None:
     """Handle HTTP connection by parsing Host header"""
     client_ip, _ = writer.get_extra_info('peername')
@@ -205,7 +205,6 @@ async def handle_http_client(
             await writer.wait_closed()
             return
 
-        # Remove port if present
         host_ar = host_str.split(':')
         host = host_ar[0]
         try:
@@ -219,6 +218,7 @@ async def handle_http_client(
             client_ip,
             proxy_host, proxy_port,
             no_proxy_list,
+            proxy_only_list,
             initial_data=data,
             is_https=False
         )
@@ -242,19 +242,25 @@ async def proxy_connection(
     proxy_host: Optional[str],
     proxy_port: Optional[int],
     no_proxy_list: List[str],
+    proxy_only_list: List[str],
     initial_data: bytes = b'',
     is_https: bool = False
 ) -> None:
     """Proxy connection to target either directly or via proxy"""
-    # Check if host is in no_proxy list
+    use_proxy = True
+
+    # Check no_proxy first (highest priority)
     if any(target_host.endswith(domain) for domain in no_proxy_list):
-        print(f"{client_ip} => {original_ip}:{target_port}: Direct connection for {target_host}:{target_port} (no_proxy rule)")
-        remote_reader, remote_writer = await connect_direct(target_host, target_port)
-    elif proxy_host and proxy_port:
+        use_proxy = False
+    else:
+        # Check proxy_only_list if not empty
+        if proxy_only_list:
+            if not any(target_host.endswith(domain) for domain in proxy_only_list):
+                use_proxy = False
+
+    if use_proxy and proxy_host and proxy_port:
         print(f"{client_ip} => {original_ip}:{target_port}: Proxying connection for {target_host}:{target_port} via {proxy_host}:{proxy_port}")
         remote_reader, remote_writer = await asyncio.open_connection(proxy_host, proxy_port)
-
-        # Send CONNECT request for both HTTP and HTTPS
         connect_request = (
             f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
             f"Host: {target_host}:{target_port}\r\n"
@@ -264,8 +270,6 @@ async def proxy_connection(
         )
         remote_writer.write(connect_request.encode())
         await remote_writer.drain()
-
-        # Check proxy response
         response = await remote_reader.readuntil(b"\r\n\r\n")
         if not response.startswith(b"HTTP/1.1 200"):
             print(f"Proxy connection failed: {response.decode(errors='ignore')}")
@@ -275,15 +279,13 @@ async def proxy_connection(
             await client_writer.wait_closed()
             return
     else:
-        print(f"{client_ip} => {original_ip}:{target_port}: Direct connection for {target_host} (no proxy configured)")
+        print(f"{client_ip} => {original_ip}:{target_port}: Direct connection for {target_host}:{target_port}")
         remote_reader, remote_writer = await connect_direct(target_host, target_port)
 
-    # Forward initial data if any
     if initial_data:
         remote_writer.write(initial_data)
         await remote_writer.drain()
 
-    # Start proxying
     await asyncio.gather(
         pipe(client_reader, remote_writer),
         pipe(remote_reader, client_writer)
@@ -295,15 +297,16 @@ async def start_servers(
     http_port: int,
     proxy_host: Optional[str],
     proxy_port: Optional[int],
-    no_proxy_list: List[str]
+    no_proxy_list: List[str],
+    proxy_only_list: List[str]
 ) -> None:
     """Start both HTTP and HTTPS proxy servers"""
     https_server = await asyncio.start_server(
-        lambda r, w: handle_https_client(r, w, proxy_host, proxy_port, no_proxy_list),
+        lambda r, w: handle_https_client(r, w, proxy_host, proxy_port, no_proxy_list, proxy_only_list),
         listen_host, https_port)
 
     http_server = await asyncio.start_server(
-        lambda r, w: handle_http_client(r, w, proxy_host, proxy_port, no_proxy_list),
+        lambda r, w: handle_http_client(r, w, proxy_host, proxy_port, no_proxy_list, proxy_only_list),
         listen_host, http_port)
 
     print(f"SNI proxy (HTTPS) listening on {listen_host}:{https_port}")
@@ -312,8 +315,9 @@ async def start_servers(
     if proxy_host and proxy_port:
         print(f"Forwarding to proxy at {proxy_host}:{proxy_port}")
     else:
-        print("No proxy configured (will use direct connections)")
+        print("No proxy configured (will use direct connections when allowed)")
     print(f"No proxy rules: {no_proxy_list or 'none'}")
+    print(f"Proxy only rules: {proxy_only_list or 'none'}")
 
     async with https_server, http_server:
         await asyncio.gather(
@@ -322,12 +326,12 @@ async def start_servers(
         )
 
 def main():
-    # Get settings from environment
     env_proxy_host, env_proxy_port = get_proxy_from_env()
     env_no_proxy = get_no_proxy_list()
+    env_proxy_only = get_proxy_only_list()
     env_listen = os.environ.get('LISTEN', DEFAULT_LISTEN_HOST)
-    env_https_port = os.environ.get('HTTPS_PORT', DEFAULT_LISTEN_PORT)
-    env_http_port = os.environ.get('HTTP_PORT', DEFAULT_LISTEN_HTTP_PORT)
+    env_https_port = os.environ.get('HTTPS_PORT', str(DEFAULT_LISTEN_PORT))
+    env_http_port = os.environ.get('HTTP_PORT', str(DEFAULT_LISTEN_HTTP_PORT))
 
     parser = argparse.ArgumentParser(description='Async HTTP/HTTPS Proxy with client IP forwarding')
     parser.add_argument('--listen-host', default=env_listen, help='Host to listen on')
@@ -336,10 +340,12 @@ def main():
     parser.add_argument('--proxy-host', default=env_proxy_host, help='Proxy server host')
     parser.add_argument('--proxy-port', type=int, default=env_proxy_port, help='Proxy server port')
     parser.add_argument('--no-proxy', default=','.join(env_no_proxy), help='Comma-separated list of domains to exclude from proxying')
+    parser.add_argument('--proxy-only', default=','.join(env_proxy_only), help='Comma-separated list of domains to proxy only')
 
     args = parser.parse_args()
 
     no_proxy_list = [domain.strip().lower() for domain in args.no_proxy.split(',') if domain.strip()]
+    proxy_only_list = [domain.strip().lower() for domain in args.proxy_only.split(',') if domain.strip()]
 
     asyncio.run(start_servers(
         args.listen_host,
@@ -347,7 +353,8 @@ def main():
         args.http_port,
         args.proxy_host,
         args.proxy_port,
-        no_proxy_list
+        no_proxy_list,
+        proxy_only_list
     ))
 
 if __name__ == "__main__":
