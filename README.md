@@ -35,7 +35,7 @@ It always passes the domain from SNI (or from the Host header for HTTP) to the p
 
 It sends the X-Forwarded-For header to the proxy (useful, for example, when intercepting all VM traffic and routing it through a proxy—the proxy will see the correct source VM). The proxy must be configured to trust headers from allowed hosts.
 
-It supports NO_PROXY, but it's highly recommended to exclude unnecessary traffic via iptables rules instead, as this feature can slow things down and potentially break.
+It supports NO_PROXY and PROXY_ONLY lists, but it's highly recommended to exclude unnecessary traffic via iptables rules instead, as this feature can slow things down and potentially break.
 
 
 ```
